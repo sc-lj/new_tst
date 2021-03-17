@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch
 import os
 import torch
+from torch.nn import RNN
 import numpy as np
 import random
 from sklearn.model_selection import StratifiedKFold
@@ -17,28 +18,30 @@ from torch.utils.data import Dataset, DataLoader
 import argparse
 # from transformers.modeling_roberta import RobertaModel
 from transformers.modeling_bert import BertModel,BertForMultipleChoice
-
+from torch.distributed.optim import optimizer
 from transformers.modeling_xlnet import XLNetForMultipleChoice,XLNetModel,XLNetForQuestionAnswering
 from transformers.tokenization_xlnet import XLNetTokenizer
+
+
 
 
 def parse_args():
 
     args = argparse.ArgumentParser()
-    args.add_argument("--pretrain_path", default=r"E:\PythonProgram\NLPCode\PretrainModel\chinese_xlnet_base_pytorch")
+    args.add_argument("--pretrain_path", default="/mnt/disk1/home/lujun/PythonProgram/learn_from_data/pretrainModelPath/xlnet_mid_torch")
     # args.add_argument("--pretrain_path",default=r"E:\PythonProgram\NLPCode\PretrainModel\chinese_bert_base")
     args.add_argument("--fold_num",default=5,help="几折交叉验证")
     args.add_argument("--seed",default=101)
-    args.add_argument("--context_max_len",default=800)
+    args.add_argument("--context_max_len",default=509)
     args.add_argument("--choice_max_len",default=120)
-    args.add_argument("--epochs",default=8)
+    args.add_argument("--epochs",default=20)
     args.add_argument("--train_bs",default=2)
-    args.add_argument("--valid_bs",default=12)
-    args.add_argument("--lr",default=2e-5)
-    args.add_argument("--accum_iter",default=2)
+    args.add_argument("--valid_bs",default=2)
+    args.add_argument("--lr",default=2e-9)
+    args.add_argument("--accum_iter",default=4)
     args.add_argument("--weight_decay",default=1e-4)
     args.add_argument("--filename",default=r"data-public/train_v2.json")
-    args.add_argument("--num_workers",default=0)
+    args.add_argument("--num_workers",default=6)
     return args.parse_args()
 
 
@@ -86,7 +89,8 @@ def test_model(model, val_loader,device,criterion):  # 验证
             input_ids, attention_mask, token_type_ids, y = input_ids.to(device), attention_mask.to(
                 device), token_type_ids.to(device), y.to(device).long()
 
-            output = model(input_ids, attention_mask, token_type_ids).logits
+            output = model(input_ids, attention_mask, token_type_ids)
+            output = output[0]
 
             y_truth.extend(y.cpu().numpy())
             y_pred.extend(output.argmax(1).cpu().numpy())
@@ -117,19 +121,21 @@ def train_model(model, train_loader,optimizer,criterion,scaler,scheduler,
         input_ids, attention_mask, token_type_ids, y = input_ids.to(device), attention_mask.to(
             device), token_type_ids.to(device), y.to(device).long()
 
-        with autocast():  # 使用半精度训练
-            outputs = model(input_ids,token_type_ids, attention_mask)
-            output = outputs[0]
+        # with autocast():  # 使用半精度训练
+        outputs = model(input_ids,token_type_ids, attention_mask)
+        output = outputs[0]
 
-            loss = criterion(output, y)
-            scaler.scale(loss).backward()
-            # loss.backward()
+        loss = criterion(output, y.view(-1))
+        # scaler.scale(loss).backward()
+        loss.backward()
 
-            if ((step + 1) % args.accum_iter == 0) or ((step + 1) == len(train_loader)):  # 梯度累加
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                scheduler.step()
+        if ((step + 1) % args.accum_iter == 0) or ((step + 1) == len(train_loader)):  # 梯度累加
+            # scaler.step(optimizer)
+            # scaler.update()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
 
         acc = (output.argmax(1) == y).sum().item() / y.size(0)
 
@@ -140,10 +146,6 @@ def train_model(model, train_loader,optimizer,criterion,scaler,scheduler,
 
     return losses.avg, accs.avg
 
-class MultipleChoice(BertForMultipleChoice):
-    def __init__(self, config):
-        super().__init__(config)
-        self.classifier = nn.Linear(config.hidden_size, 4)
 
 
 def main(args):
@@ -189,6 +191,7 @@ def main(args):
         model = XLNetForMultipleChoice.from_pretrained(args.pretrain_path)
         # model = BertForMultipleChoice.from_pretrained(args.pretrain_path)
         model.to(device)# 模型
+        model.resize_token_embeddings(len(train_set.tokenizer))
 
         scaler = GradScaler()
         optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)  # AdamW优化器
@@ -206,7 +209,7 @@ def main(args):
 
             if val_acc > best_acc:
                 best_acc = val_acc
-                torch.save(model.state_dict(), '{}_fold_{}.pt'.format(args['model'].split('/')[-1], fold))
+                torch.save(model.state_dict(), '{}_fold_{}.pt'.format("xlnet", fold))
 
         cv.append(best_acc)
 
